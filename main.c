@@ -5,6 +5,7 @@
 
 #include <naomi/video.h>
 #include "netdimm_net.h"
+#include "netdimm_dns.h"
 #include "netdiag_config.h"
 
 #define UDP_AF_INET       2u
@@ -18,6 +19,7 @@
 static netdimm_net_t g_net;
 static uint32_t g_socket;
 static uint32_t g_socket_open;
+static uint8_t g_resolved_ip[4];
 static uint32_t g_sent_packets;
 static uint32_t g_received_packets;
 static uint32_t g_sent_bytes;
@@ -30,41 +32,66 @@ static char g_detail[112] = "Reading BIOS NetDIMM configuration";
 static void draw_page(void)
 {
     video_fill_screen(rgb(12, 18, 28));
-    video_draw_debug_text(18, 16, rgb(255, 255, 255), "NAOMI NETDIMM UDP ECHO TEST");
+
+    video_draw_debug_text(18, 16, rgb(255, 255, 255),
+                          "NAOMI NETDIMM UDP ECHO TEST");
+
     video_draw_debug_text(18, 44, rgb(170, 210, 255),
                           "BIOS:%08X DIMM:%u MiB BASE:%08X",
                           (unsigned int)g_net.bios_config,
                           (unsigned int)(g_net.dimm_size / (1024u * 1024u)),
                           (unsigned int)g_net.dimm_buffer_offset);
+
     video_draw_debug_text(18, 72, rgb(170, 210, 255),
                           "SERVER %u.%u.%u.%u:%u UDP",
                           NETDIAG_SERVER_IP0, NETDIAG_SERVER_IP1,
                           NETDIAG_SERVER_IP2, NETDIAG_SERVER_IP3,
                           NETDIAG_UDP_PORT);
-    video_draw_debug_text(18, 112, rgb(255, 220, 120), "STAGE: %s", g_stage);
-    video_draw_debug_text(18, 138, rgb(230, 230, 230), "%.90s", g_detail);
-    video_draw_debug_text(18, 184, rgb(180, 220, 180),
+
+    video_draw_debug_text(18, 98, rgb(170, 210, 255),
+                          "DNS %u.%u.%u.%u:%u",
+                          NETDIAG_DNS_SERVER_IP0, NETDIAG_DNS_SERVER_IP1,
+                          NETDIAG_DNS_SERVER_IP2, NETDIAG_DNS_SERVER_IP3,
+                          NETDIAG_DNS_PORT);
+
+    video_draw_debug_text(18, 124, rgb(200, 210, 225),
+                          "A RECORD %s -> %u.%u.%u.%u",
+                          NETDIAG_DNS_HOSTNAME,
+                          g_resolved_ip[0], g_resolved_ip[1],
+                          g_resolved_ip[2], g_resolved_ip[3]);
+
+    video_draw_debug_text(18, 158, rgb(255, 220, 120),
+                          "STAGE: %s", g_stage);
+
+    video_draw_debug_text(18, 184, rgb(230, 230, 230),
+                          "%.90s", g_detail);
+
+    video_draw_debug_text(18, 218, rgb(180, 220, 180),
                           "PACKETS SENT:%u  RECEIVED:%u",
                           (unsigned int)g_sent_packets,
                           (unsigned int)g_received_packets);
-    video_draw_debug_text(18, 210, rgb(180, 220, 180),
+
+    video_draw_debug_text(18, 244, rgb(180, 220, 180),
                           "BYTES SENT:%u  RECEIVED:%u",
                           (unsigned int)g_sent_bytes,
                           (unsigned int)g_received_bytes);
-    video_draw_debug_text(18, 252, rgb(200, 210, 225),
+
+    video_draw_debug_text(18, 278, rgb(200, 210, 225),
                           "LAST SEND:%08X  LAST RECV:%08X",
                           (unsigned int)g_last_send_result,
                           (unsigned int)g_last_recv_result);
+
     video_draw_debug_text(18, 430, rgb(150, 170, 190),
                           "The server must be running on the configured LAN address.");
+
     video_draw_debug_text(18, 452, rgb(150, 170, 190),
                           "DIMM CMD:%04X STAT:%04X RESULT:%08X",
                           (unsigned int)g_net.last_command,
                           (unsigned int)g_net.last_status,
                           (unsigned int)g_net.last_result);
+
     video_display_on_vblank();
 }
-
 static void progress_callback(void *opaque)
 {
     (void)opaque;
@@ -128,6 +155,45 @@ static int configure_socket(void)
     return result == 0u ? NETDIMM_NET_OK : NETDIMM_NET_ERR_DEVICE;
 }
 
+static void resolve_dns_test(const uint8_t dns_server[4])
+{
+    netdimm_dns_result_t result;
+    char detail[112];
+    int rc;
+
+    memset(&result, 0, sizeof(result));
+
+    set_stage("DNS RESOLVE", "Resolving " NETDIAG_DNS_HOSTNAME " A record");
+
+    rc = netdimm_dns_resolve_a(
+        &g_net,
+        dns_server,
+        NETDIAG_DNS_HOSTNAME,
+        ECHO_WAIT_FRAMES,
+        g_resolved_ip,
+        &result
+    );
+
+    if (rc != NETDIMM_DNS_OK) {
+        snprintf(detail, sizeof(detail),
+                 "%s tx=%u rx=%u err=%u",
+                 netdimm_dns_error_string(rc),
+                 (unsigned int)result.bytes_sent,
+                 (unsigned int)result.bytes_received,
+                 (unsigned int)result.socket_error);
+
+        fail_forever("DNS RESOLVE FAILED", detail);
+    }
+
+    snprintf(detail, sizeof(detail),
+             "%s -> %u.%u.%u.%u",
+             NETDIAG_DNS_HOSTNAME,
+             g_resolved_ip[0], g_resolved_ip[1],
+             g_resolved_ip[2], g_resolved_ip[3]);
+
+    set_stage("DNS RESOLVE PASSED", detail);
+}
+
 static void build_echo_packet(uint32_t sequence, uint8_t packet[ECHO_PACKET_SIZE])
 {
     size_t i;
@@ -152,6 +218,10 @@ int main(void)
         NETDIAG_SERVER_IP0, NETDIAG_SERVER_IP1,
         NETDIAG_SERVER_IP2, NETDIAG_SERVER_IP3
     };
+    static const uint8_t dns_server[4] = {
+        NETDIAG_DNS_SERVER_IP0, NETDIAG_DNS_SERVER_IP1,
+        NETDIAG_DNS_SERVER_IP2, NETDIAG_DNS_SERVER_IP3
+    };
     uint8_t tx[ECHO_PACKET_SIZE];
     uint8_t rx[ECHO_RX_CAPACITY];
     uint32_t command_result = 0xFFFFFFFFu;
@@ -173,6 +243,8 @@ int main(void)
     if (rc != NETDIMM_NET_OK) {
         fail_forever("PIO SELF-TEST FAILED", netdimm_net_error_string(rc));
     }
+
+    resolve_dns_test(dns_server);
 
     set_stage("UDP SOCKET OPEN", "Creating an IPv4 datagram socket");
     rc = netdimm_socket_open(&g_net, UDP_AF_INET, UDP_SOCK_DGRAM,
