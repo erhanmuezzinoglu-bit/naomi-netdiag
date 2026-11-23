@@ -1,0 +1,34 @@
+Install into the existing examples/netdiag folder:
+
+  tar -xzf netplay_netdimm_stage4.tar.gz
+
+This archive includes a replacement Makefile that preserves the existing
+APP=echo default and adds APP=host / APP=join targets. It also adds new
+netplay source files. It does not overwrite main.c, netdimm_net.c/.h,
+netdimm_dns.c/.h, netdiag_config.h, udp_echo_server.py, or run.sh.
+
+Append generated-file exclusions to .gitignore with:
+
+  cat .gitignore.stage4.append >> .gitignore
+
+Run the host-side checks:
+
+  ./test_netplay_stage4.sh
+
+Build one of the Naomi ROMs:
+
+  source /opt/toolchains/naomi/env.sh
+  make -B APP=host
+  make -B APP=join
+
+Or launch each Flycast app (each command builds/pack/starts its own role):
+
+  ./run_netplay.sh host
+  ./run_netplay.sh join
+
+Before the two Flycast launches, start the relay server in another terminal:
+
+  python3 netplay_relay_server.py --bind 0.0.0.0 --port 19001
+
+The host IP and room are in netplay_config.h. Both roles must use the same
+room code and reachable relay IP.

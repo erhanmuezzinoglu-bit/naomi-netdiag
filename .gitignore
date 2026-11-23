@@ -16,3 +16,12 @@
 /main.c.backup
 __pycache__/
 *.pyc
+
+# Generated NDNP tests and HOST/JOIN NetDIMM packages
+/netplay_protocol_test
+/netplay_client_posix_test
+/netplay_netdimm_test
+/netplay_host.bin
+/netplay_join.bin
+/netplay_host_hle/
+/netplay_join_hle/
