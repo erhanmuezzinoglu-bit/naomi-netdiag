@@ -14,7 +14,7 @@ include ../../Makefile.base
 # Provide the top-level ROM creation target for this binary.
 netdimm.bin: ${MAKEROM_FILE} ${NAOMI_BIN_FILE}
 	${MAKEROM} $@ \
-		--title "Fightcade API Bridge Test" \
+		--title "Naomi NetDiag UDP Echo Test" \
 		--publisher "Homebrew" \
 		--serial "${SERIAL}" \
 		--section ${NAOMI_BIN_FILE},${START_ADDR} \

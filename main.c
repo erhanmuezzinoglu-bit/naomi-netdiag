@@ -1,97 +1,62 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include <naomi/video.h>
 #include "netdimm_net.h"
+#include "netdiag_config.h"
 
-/*
- * Fightcade Public API test.
- *
- * The Fightcade API is HTTPS. The current NetDIMM HLE socket driver has no
- * TLS layer, so this Naomi program talks plain HTTP to the small local
- * fightcade_api_bridge.py process. The bridge performs the HTTPS request.
- *
- * By default Flycast and the bridge run on the same PC, so loopback is used.
- */
-#define PROXY_IP0                 127u
-#define PROXY_IP1                 0u
-#define PROXY_IP2                 0u
-#define PROXY_IP3                 1u
-#define PROXY_PORT                8765u
-#define PROXY_PATH                "/cvs2"
+#define UDP_AF_INET       2u
+#define UDP_SOCK_DGRAM    2u
+#define UDP_IPPROTO_UDP   17u
 
-#define HTTP_WAIT_FRAMES          NETDIMM_NET_DEFAULT_WAIT_FRAMES
-#define HTTP_TIMEOUT_MS           15000u
-#define HTTP_RX_CAPACITY          4096u
-#define HTTP_CHUNK_CAPACITY       768u
-#define MATCH_DISPLAY_COUNT       6u
-#define MATCH_TEXT_CAPACITY       96u
+#define ECHO_PACKET_SIZE  32u
+#define ECHO_RX_CAPACITY  64u
+#define ECHO_WAIT_FRAMES  NETDIAG_ECHO_WAIT_FRAMES
 
 static netdimm_net_t g_net;
 static uint32_t g_socket;
 static uint32_t g_socket_open;
-static uint32_t g_connect_result = 0xFFFFFFFFu;
-static uint32_t g_sent;
-static uint32_t g_received;
-static uint32_t g_close_result = 0xFFFFFFFFu;
-static uint32_t g_pio_pass;
-static uint32_t g_scanned;
-static uint32_t g_match_count;
-static uint32_t g_http_status;
-static uint32_t g_api_ok;
-static char g_status_line[64] = "(not received)";
+static uint32_t g_sent_packets;
+static uint32_t g_received_packets;
+static uint32_t g_sent_bytes;
+static uint32_t g_received_bytes;
+static uint32_t g_last_send_result = 0xFFFFFFFFu;
+static uint32_t g_last_recv_result = 0xFFFFFFFFu;
 static char g_stage[40] = "INITIALIZING";
 static char g_detail[112] = "Reading BIOS NetDIMM configuration";
-static char g_matches[MATCH_DISPLAY_COUNT][MATCH_TEXT_CAPACITY];
 
 static void draw_page(void)
 {
-    unsigned int i;
-    char proxy_text[64];
-
-    snprintf(proxy_text, sizeof(proxy_text), "PROXY %u.%u.%u.%u:%u",
-             (unsigned int)PROXY_IP0, (unsigned int)PROXY_IP1,
-             (unsigned int)PROXY_IP2, (unsigned int)PROXY_IP3,
-             (unsigned int)PROXY_PORT);
-
     video_fill_screen(rgb(12, 18, 28));
-    video_draw_debug_text(18, 16, rgb(255, 255, 255), "FIGHTCADE PUBLIC API TEST");
-    video_draw_debug_text(18, 40, rgb(170, 210, 255),
+    video_draw_debug_text(18, 16, rgb(255, 255, 255), "NAOMI NETDIMM UDP ECHO TEST");
+    video_draw_debug_text(18, 44, rgb(170, 210, 255),
                           "BIOS:%08X DIMM:%u MiB BASE:%08X",
                           (unsigned int)g_net.bios_config,
                           (unsigned int)(g_net.dimm_size / (1024u * 1024u)),
                           (unsigned int)g_net.dimm_buffer_offset);
-    video_draw_debug_text(18, 62, rgb(170, 210, 255), "%s", proxy_text);
-
-    video_draw_debug_text(18, 92, rgb(255, 220, 120), "STAGE: %s", g_stage);
-    video_draw_debug_text(18, 114, rgb(230, 230, 230), "%.82s", g_detail);
-    video_draw_debug_text(18, 142, rgb(180, 220, 180), "PIO SELF-TEST: %s",
-                          g_pio_pass ? "PASS" : "NOT RUN / FAILED");
-    video_draw_debug_text(18, 164, rgb(180, 220, 180),
-                          "HTTP:%u SENT:%u RECV:%u CLOSE:%08X",
-                          (unsigned int)g_http_status,
-                          (unsigned int)g_sent,
-                          (unsigned int)g_received,
-                          (unsigned int)g_close_result);
-    video_draw_debug_text(18, 186, rgb(255, 220, 120), "%.60s", g_status_line);
-
-    video_draw_debug_text(18, 218, rgb(180, 220, 180),
-                          "API:%s SCANNED:%u CVS2 MATCHES:%u",
-                          g_api_ok ? "OK" : "--",
-                          (unsigned int)g_scanned,
-                          (unsigned int)g_match_count);
-    for (i = 0u; i < MATCH_DISPLAY_COUNT; i++) {
-        if (g_matches[i][0] != '\0') {
-            video_draw_debug_text(18, 246 + (int)(i * 27u),
-                                  rgb(225, 230, 240), "%.90s", g_matches[i]);
-        }
-    }
-
+    video_draw_debug_text(18, 72, rgb(170, 210, 255),
+                          "SERVER %u.%u.%u.%u:%u UDP",
+                          NETDIAG_SERVER_IP0, NETDIAG_SERVER_IP1,
+                          NETDIAG_SERVER_IP2, NETDIAG_SERVER_IP3,
+                          NETDIAG_UDP_PORT);
+    video_draw_debug_text(18, 112, rgb(255, 220, 120), "STAGE: %s", g_stage);
+    video_draw_debug_text(18, 138, rgb(230, 230, 230), "%.90s", g_detail);
+    video_draw_debug_text(18, 184, rgb(180, 220, 180),
+                          "PACKETS SENT:%u  RECEIVED:%u",
+                          (unsigned int)g_sent_packets,
+                          (unsigned int)g_received_packets);
+    video_draw_debug_text(18, 210, rgb(180, 220, 180),
+                          "BYTES SENT:%u  RECEIVED:%u",
+                          (unsigned int)g_sent_bytes,
+                          (unsigned int)g_received_bytes);
+    video_draw_debug_text(18, 252, rgb(200, 210, 225),
+                          "LAST SEND:%08X  LAST RECV:%08X",
+                          (unsigned int)g_last_send_result,
+                          (unsigned int)g_last_recv_result);
     video_draw_debug_text(18, 430, rgb(150, 170, 190),
-                          "Recent completed matches only - not live room presence");
+                          "The server must be running on the configured LAN address.");
     video_draw_debug_text(18, 452, rgb(150, 170, 190),
                           "DIMM CMD:%04X STAT:%04X RESULT:%08X",
                           (unsigned int)g_net.last_command,
@@ -120,7 +85,6 @@ static void close_socket(void)
     if (g_socket_open != 0u) {
         uint32_t result = 0xFFFFFFFFu;
         (void)netdimm_socket_close(&g_net, g_socket, &result);
-        g_close_result = result;
         g_socket_open = 0u;
     }
 }
@@ -154,9 +118,9 @@ static int configure_socket(void)
 {
     uint32_t result = 0xFFFFFFFFu;
     int rc = netdimm_socket_set_timeout(&g_net, g_socket,
-                                        HTTP_TIMEOUT_MS,
-                                        HTTP_TIMEOUT_MS,
-                                        HTTP_TIMEOUT_MS,
+                                        NETDIAG_SOCKET_TIMEOUT_MS,
+                                        NETDIAG_SOCKET_TIMEOUT_MS,
+                                        NETDIAG_SOCKET_TIMEOUT_MS,
                                         &result);
     if (rc != NETDIMM_NET_OK) {
         return rc;
@@ -164,231 +128,35 @@ static int configure_socket(void)
     return result == 0u ? NETDIMM_NET_OK : NETDIMM_NET_ERR_DEVICE;
 }
 
-static int find_bytes(const char *data, size_t data_length,
-                      const char *needle, size_t needle_length,
-                      size_t *position)
+static void build_echo_packet(uint32_t sequence, uint8_t packet[ECHO_PACKET_SIZE])
 {
     size_t i;
 
-    if (needle_length == 0u || data_length < needle_length) {
-        return 0;
-    }
-    for (i = 0u; i <= data_length - needle_length; i++) {
-        if (memcmp(data + i, needle, needle_length) == 0) {
-            if (position != NULL) {
-                *position = i;
-            }
-            return 1;
-        }
-    }
-    return 0;
-}
+    packet[0] = 'N';
+    packet[1] = 'D';
+    packet[2] = 'G';
+    packet[3] = '1';
+    packet[4] = (uint8_t)(sequence >> 24);
+    packet[5] = (uint8_t)(sequence >> 16);
+    packet[6] = (uint8_t)(sequence >> 8);
+    packet[7] = (uint8_t)sequence;
 
-static int parse_content_length(const char *headers, size_t header_length,
-                                uint32_t *content_length)
-{
-    static const char key[] = "Content-Length:";
-    size_t pos;
-
-    for (pos = 0u; pos + sizeof(key) - 1u <= header_length; pos++) {
-        if (memcmp(headers + pos, key, sizeof(key) - 1u) == 0) {
-            const char *p = headers + pos + sizeof(key) - 1u;
-            uint32_t value = 0u;
-            int digits = 0;
-
-            while ((size_t)(p - headers) < header_length && (*p == ' ' || *p == '\t')) {
-                p++;
-            }
-            while ((size_t)(p - headers) < header_length && *p >= '0' && *p <= '9') {
-                value = value * 10u + (uint32_t)(*p - '0');
-                digits = 1;
-                p++;
-            }
-            if (!digits) {
-                return 0;
-            }
-            *content_length = value;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static void copy_status_line(const char *response, size_t length)
-{
-    size_t i;
-    size_t out = 0u;
-
-    memset(g_status_line, 0, sizeof(g_status_line));
-    for (i = 0u; i < length && out + 1u < sizeof(g_status_line); i++) {
-        char ch = response[i];
-        if (ch == '\r' || ch == '\n') {
-            break;
-        }
-        if ((unsigned char)ch < 32u || (unsigned char)ch > 126u) {
-            ch = '.';
-        }
-        g_status_line[out++] = ch;
-    }
-    if (out == 0u) {
-        strncpy(g_status_line, "(no HTTP status line)", sizeof(g_status_line) - 1u);
-    }
-    g_status_line[sizeof(g_status_line) - 1u] = '\0';
-}
-
-static int receive_http_response(char *response, size_t capacity,
-                                 size_t *response_length, size_t *body_offset,
-                                 size_t *body_length)
-{
-    char chunk[HTTP_CHUNK_CAPACITY];
-    size_t total = 0u;
-    size_t header_end = 0u;
-    uint32_t content_length = 0u;
-    int have_content_length = 0;
-
-    if (response == NULL || response_length == NULL ||
-        body_offset == NULL || body_length == NULL || capacity < 32u) {
-        return -1;
-    }
-
-    while (total + 1u < capacity) {
-        uint32_t got = 0u;
-        int rc = netdimm_socket_recv(&g_net, g_socket, chunk,
-                                     sizeof(chunk), HTTP_WAIT_FRAMES, &got);
-        if (rc != NETDIMM_NET_OK) {
-            return -2;
-        }
-        if (got == 0u) {
-            break;
-        }
-        if ((size_t)got > capacity - total - 1u) {
-            return -3;
-        }
-        memcpy(response + total, chunk, got);
-        total += got;
-        response[total] = '\0';
-
-        if (header_end == 0u) {
-            size_t marker = 0u;
-            if (find_bytes(response, total, "\r\n\r\n", 4u, &marker)) {
-                header_end = marker + 4u;
-                have_content_length = parse_content_length(response, marker,
-                                                           &content_length);
-                if (!have_content_length || content_length > capacity - header_end - 1u) {
-                    return -4;
-                }
-            }
-        }
-
-        if (header_end != 0u && have_content_length &&
-            total >= header_end + (size_t)content_length) {
-            break;
-        }
-    }
-
-    response[total] = '\0';
-    *response_length = total;
-    if (header_end == 0u || !have_content_length ||
-        total < header_end + (size_t)content_length) {
-        return -5;
-    }
-    *body_offset = header_end;
-    *body_length = (size_t)content_length;
-    return 0;
-}
-
-static char *next_field(char **cursor)
-{
-    char *field = *cursor;
-    char *separator = strchr(field, '|');
-
-    if (separator != NULL) {
-        *separator = '\0';
-        *cursor = separator + 1;
-    } else {
-        *cursor = field + strlen(field);
-    }
-    return field;
-}
-
-static char *next_line(char **cursor)
-{
-    char *line;
-    char *p;
-
-    if (cursor == NULL || *cursor == NULL || **cursor == '\0') {
-        return NULL;
-    }
-
-    line = *cursor;
-    p = line;
-    while (*p != '\0' && *p != '\r' && *p != '\n') {
-        p++;
-    }
-    if (*p != '\0') {
-        *p++ = '\0';
-        while (*p == '\r' || *p == '\n') {
-            p++;
-        }
-    }
-    *cursor = (*p != '\0') ? p : NULL;
-    return line;
-}
-
-static void parse_proxy_body(const char *body_data, size_t body_length)
-{
-    char body[HTTP_RX_CAPACITY];
-    char *cursor;
-    char *line;
-
-    g_api_ok = 0u;
-    g_scanned = 0u;
-    g_match_count = 0u;
-    memset(g_matches, 0, sizeof(g_matches));
-
-    if (body_length >= sizeof(body)) {
-        return;
-    }
-    memcpy(body, body_data, body_length);
-    body[body_length] = '\0';
-    cursor = body;
-
-    while ((line = next_line(&cursor)) != NULL) {
-        if (strncmp(line, "STATUS=OK", 9u) == 0) {
-            g_api_ok = 1u;
-        } else if (strncmp(line, "SCANNED=", 8u) == 0) {
-            g_scanned = (uint32_t)strtoul(line + 8u, NULL, 10);
-        } else if (strncmp(line, "M|", 2u) == 0 &&
-                   g_match_count < MATCH_DISPLAY_COUNT) {
-            char *field_cursor = line + 2u;
-            char *date = next_field(&field_cursor);
-            char *duration = next_field(&field_cursor);
-            char *player1 = next_field(&field_cursor);
-            char *player2 = field_cursor;
-
-            snprintf(g_matches[g_match_count], MATCH_TEXT_CAPACITY,
-                     "%s %s %s vs %s", date, duration, player1, player2);
-            g_match_count++;
-        }
+    for (i = 8u; i < ECHO_PACKET_SIZE; i++) {
+        packet[i] = (uint8_t)(0xA5u ^ sequence ^ (uint32_t)(i * 17u));
     }
 }
 
 int main(void)
 {
-    static const uint8_t proxy_ip[4] = {
-        PROXY_IP0, PROXY_IP1, PROXY_IP2, PROXY_IP3
+    static const uint8_t server_ip[4] = {
+        NETDIAG_SERVER_IP0, NETDIAG_SERVER_IP1,
+        NETDIAG_SERVER_IP2, NETDIAG_SERVER_IP3
     };
-    static const char http_request[] =
-        "GET " PROXY_PATH " HTTP/1.0\r\n"
-        "Host: 127.0.0.1:8765\r\n"
-        "Accept: text/plain\r\n"
-        "Connection: close\r\n"
-        "\r\n";
-
-    char response[HTTP_RX_CAPACITY];
-    size_t response_length = 0u;
-    size_t body_offset = 0u;
-    size_t body_length = 0u;
+    uint8_t tx[ECHO_PACKET_SIZE];
+    uint8_t rx[ECHO_RX_CAPACITY];
+    uint32_t command_result = 0xFFFFFFFFu;
+    uint32_t received = 0u;
+    uint32_t sequence;
     int rc;
 
     video_init(VIDEO_COLOR_1555);
@@ -401,89 +169,83 @@ int main(void)
     netdimm_net_set_progress_callback(&g_net, progress_callback, NULL);
 
     set_stage("PIO SELF-TEST", "Checking DIMM PIO read/write path");
-    rc = netdimm_net_pio_self_test(&g_net, 0x46434150u);
+    rc = netdimm_net_pio_self_test(&g_net, 0x4E444731u);
     if (rc != NETDIMM_NET_OK) {
         fail_forever("PIO SELF-TEST FAILED", netdimm_net_error_string(rc));
     }
-    g_pio_pass = 1u;
-    draw_page();
 
-    set_stage("TCP OPEN", "Opening a TCP connection to the local API bridge");
-    rc = netdimm_socket_open(&g_net, 2u, 1u, 6u, &g_socket);
+    set_stage("UDP SOCKET OPEN", "Creating an IPv4 datagram socket");
+    rc = netdimm_socket_open(&g_net, UDP_AF_INET, UDP_SOCK_DGRAM,
+                             UDP_IPPROTO_UDP, &g_socket);
     if (rc != NETDIMM_NET_OK || g_socket == 0u || g_socket == 0xFFFFFFFFu) {
-        fail_driver("TCP OPEN FAILED", "socket", rc);
+        fail_driver("UDP SOCKET OPEN FAILED", "socket", rc);
     }
     g_socket_open = 1u;
 
-    set_stage("TCP TIMEOUT", "Setting 15 second socket timeouts");
+    set_stage("UDP TIMEOUT", "Setting socket operation timeouts");
     rc = configure_socket();
     if (rc != NETDIMM_NET_OK) {
-        fail_driver("TCP TIMEOUT FAILED", "settimeout", rc);
+        fail_driver("UDP TIMEOUT FAILED", "settimeout", rc);
     }
 
-    set_stage("TCP CONNECT", "Connecting to 127.0.0.1:8765");
-    rc = netdimm_socket_connect_ipv4(&g_net, g_socket, proxy_ip,
-                                    (uint16_t)PROXY_PORT,
-                                    HTTP_WAIT_FRAMES, &g_connect_result);
-    if (rc != NETDIMM_NET_OK || g_connect_result != 0u) {
-        fail_driver("PROXY CONNECT FAILED", "connect", rc);
+    set_stage("UDP CONNECT", "Setting the remote UDP endpoint");
+    rc = netdimm_socket_connect_ipv4(&g_net, g_socket, server_ip,
+                                    (uint16_t)NETDIAG_UDP_PORT,
+                                    ECHO_WAIT_FRAMES, &command_result);
+    if (rc != NETDIMM_NET_OK || command_result != 0u) {
+        fail_driver("UDP CONNECT FAILED", "connect", rc);
     }
 
-    set_stage("HTTP REQUEST", "Requesting recent CvS2 matches from the local bridge");
-    rc = netdimm_socket_send(&g_net, g_socket, http_request,
-                             (uint32_t)(sizeof(http_request) - 1u),
-                             HTTP_WAIT_FRAMES, &g_sent);
-    if (rc != NETDIMM_NET_OK || g_sent != sizeof(http_request) - 1u) {
-        fail_driver("HTTP SEND FAILED", "send", rc);
-    }
-
-    set_stage("HTTP RECEIVE", "Waiting for the Fightcade API bridge response");
-    memset(response, 0, sizeof(response));
-    rc = receive_http_response(response, sizeof(response),
-                               &response_length, &body_offset, &body_length);
-    if (rc != 0) {
+    for (sequence = 1u; sequence <= NETDIAG_ECHO_ROUNDS; sequence++) {
         char detail[112];
-        snprintf(detail, sizeof(detail), "HTTP receive/parser error %d; bytes=%u",
-                 rc, (unsigned int)response_length);
-        fail_forever("HTTP RESPONSE FAILED", detail);
-    }
-    g_received = (uint32_t)response_length;
-    copy_status_line(response, response_length);
 
-    if (strncmp(response, "HTTP/1.0 200", 12u) != 0 &&
-        strncmp(response, "HTTP/1.1 200", 12u) != 0) {
-        close_socket();
-        fail_forever("PROXY HTTP ERROR", g_status_line);
-    }
-    g_http_status = 200u;
+        build_echo_packet(sequence, tx);
+        snprintf(detail, sizeof(detail), "Sending test datagram %u of %u",
+                 (unsigned int)sequence, (unsigned int)NETDIAG_ECHO_ROUNDS);
+        set_stage("UDP SEND", detail);
 
-    parse_proxy_body(response + body_offset, body_length);
-    if (g_api_ok == 0u) {
-        close_socket();
-        fail_forever("API RESPONSE INVALID", "Bridge did not return STATUS=OK");
+        g_last_send_result = 0xFFFFFFFFu;
+        rc = netdimm_socket_send(&g_net, g_socket, tx, sizeof(tx),
+                                 ECHO_WAIT_FRAMES, &g_last_send_result);
+        if (rc != NETDIMM_NET_OK || g_last_send_result != sizeof(tx)) {
+            fail_driver("UDP SEND FAILED", "send", rc);
+        }
+        g_sent_packets++;
+        g_sent_bytes += g_last_send_result;
+
+        snprintf(detail, sizeof(detail), "Waiting for datagram %u echo",
+                 (unsigned int)sequence);
+        set_stage("UDP RECEIVE", detail);
+
+        memset(rx, 0, sizeof(rx));
+        received = 0u;
+        g_last_recv_result = 0xFFFFFFFFu;
+        rc = netdimm_socket_recv(&g_net, g_socket, rx, sizeof(rx),
+                                 ECHO_WAIT_FRAMES, &received);
+        g_last_recv_result = received;
+        if (rc != NETDIMM_NET_OK) {
+            fail_driver("UDP RECEIVE FAILED", "recv", rc);
+        }
+        if (received != sizeof(tx) || memcmp(tx, rx, sizeof(tx)) != 0) {
+            snprintf(detail, sizeof(detail),
+                     "Echo mismatch on packet %u: sent=%u received=%u",
+                     (unsigned int)sequence, (unsigned int)sizeof(tx),
+                     (unsigned int)received);
+            fail_forever("UDP VERIFY FAILED", detail);
+        }
+
+        g_received_packets++;
+        g_received_bytes += received;
     }
 
-    set_stage("TCP CLOSE", "Closing the local HTTP connection");
-    rc = netdimm_socket_close(&g_net, g_socket, &g_close_result);
+    set_stage("UDP CLOSE", "All echo packets matched; closing socket");
+    rc = netdimm_socket_close(&g_net, g_socket, &command_result);
     g_socket_open = 0u;
-    if (rc != NETDIMM_NET_OK || g_close_result != 0u) {
-        fail_forever("TCP CLOSE FAILED", "API response received, but socket close failed");
+    if (rc != NETDIMM_NET_OK || command_result != 0u) {
+        fail_forever("UDP CLOSE FAILED", "Echo test passed but socket close failed");
     }
 
-    if (g_match_count != 0u) {
-        char detail[112];
-        snprintf(detail, sizeof(detail),
-                 "Fightcade API OK; %u recent CvS2 replay(s) in %u global records",
-                 (unsigned int)g_match_count, (unsigned int)g_scanned);
-        set_stage("FIGHTCADE API TEST PASSED", detail);
-    } else {
-        char detail[112];
-        snprintf(detail, sizeof(detail),
-                 "API OK; no CvS2 replay in latest %u global records",
-                 (unsigned int)g_scanned);
-        set_stage("API OK / NO CVS2 MATCH", detail);
-    }
-
+    set_stage("UDP ECHO PASSED", "All test datagrams returned byte-for-byte");
     for (;;) {
         draw_page();
     }
