@@ -1,0 +1,18 @@
+# Build outputs
+/build/
+/netdimm.bin
+*.o
+*.d
+*.elf
+*.map
+*.lst
+
+# Generated NetDIMM HLE package
+/netdimm_hle/
+*.chd
+*.7z
+
+# Local backups and Python cache
+/main.c.backup
+__pycache__/
+*.pyc
